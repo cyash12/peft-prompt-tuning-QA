@@ -13,7 +13,7 @@ import sys
 def preprocess_function(examples):
     model_name_or_path = "facebook/opt-125m"
     batch_size = len(examples[text_column])
-    inputs = [f"{text_column} : {x} Label : " for x in examples[text_column]]
+    inputs = [f"{text_column} : {x} Topic : " for x in examples[text_column]]
     targets = [str(x) for x in examples[label_column]]
     model_inputs = tokenizer(inputs)
     labels = tokenizer(targets)
@@ -40,19 +40,19 @@ def preprocess_function(examples):
     return model_inputs
 
 if __name__ == '__main__':
-    dataset = load_dataset("wiki_qa")
-    text_column = "question"
-    label_column = "answer"
+    dataset = load_dataset("yahoo_answers_topics")
+    text_column = "best_answer"
+    label_column = "topic_text"
     tokenizer_name_or_path = "facebook/opt-125m"
     peft_config = PromptTuningConfig(
     task_type=TaskType.CAUSAL_LM,
     prompt_tuning_init=PromptTuningInit.TEXT,
     num_virtual_tokens=8,
-    prompt_tuning_init_text="Answer the question: ",
+    prompt_tuning_init_text="Give the topic: ",
     tokenizer_name_or_path=tokenizer_name_or_path,)
     max_length = 1024
     lr = 3e-2
-    num_epochs = 1
+    num_epochs = 10
     batch_size = 24
     device = "cuda"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
@@ -61,6 +61,13 @@ if __name__ == '__main__':
     mode = sys.argv[1]
     if mode == 'train':
         model_name_or_path = "facebook/opt-125m"
+        classes = [k.replace("_", " ") for k in dataset["train"].features["topic"].names]
+        print(classes)
+        dataset = dataset.map(
+            lambda x: {"topic_text": [classes[label] for label in x["topic"]]},
+            batched=True,
+            num_proc=1,
+        )
         processed_datasets = dataset.map(
             preprocess_function,
             batched=True,
@@ -70,7 +77,6 @@ if __name__ == '__main__':
             desc="Running tokenizer on dataset",)
         train_dataset = processed_datasets["train"]
         eval_dataset = processed_datasets["train"]
-
         train_dataloader = DataLoader(
             train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=batch_size, pin_memory=True)
         eval_dataloader = DataLoader(eval_dataset, collate_fn=default_data_collator, batch_size=batch_size, pin_memory=True)
@@ -87,7 +93,10 @@ if __name__ == '__main__':
         for epoch in range(num_epochs):
             model.train()
             total_loss = 0
+            t = 0
             for step, batch in enumerate(tqdm(train_dataloader)):
+                if t==200:
+                    break
                 batch = {k: v.to(device) for k, v in batch.items()}
                 outputs = model(**batch)
                 loss = outputs.loss
@@ -96,11 +105,15 @@ if __name__ == '__main__':
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                t+=1
 
             model.eval()
             eval_loss = 0
             eval_preds = []
+            t=0
             for step, batch in enumerate(tqdm(eval_dataloader)):
+                if t==200:
+                    break
                 batch = {k: v.to(device) for k, v in batch.items()}
                 with torch.no_grad():
                     outputs = model(**batch)
@@ -109,17 +122,20 @@ if __name__ == '__main__':
                 eval_preds.extend(
                     tokenizer.batch_decode(torch.argmax(outputs.logits, -1).detach().cpu().numpy(), skip_special_tokens=True)
                 )
+                t+=1
 
             eval_epoch_loss = eval_loss / len(eval_dataloader)
             eval_ppl = torch.exp(eval_epoch_loss)
             train_epoch_loss = total_loss / len(train_dataloader)
             train_ppl = torch.exp(train_epoch_loss)
             print(f"{epoch=}: {train_ppl=} {train_epoch_loss=} {eval_ppl=} {eval_epoch_loss=}")
-
-
+        peft_model_id = f"{model_name_or_path}_{peft_config.peft_type}_{peft_config.task_type}"
+        print(peft_model_id)
+        model.save_pretrained(peft_model_id)
+        i = 100
         model.eval()
-        inputs = tokenizer(f'{text_column} : {dataset["test"][i]["question"]} Ans : ', return_tensors="pt")
-        print(dataset["test"][i]["question"])
+        inputs = tokenizer(f'{text_column} : {dataset["test"][i]["best_answer"]} Topic : ', return_tensors="pt")
+        print(dataset["test"][i]["best_answer"])   
 
         with torch.no_grad():
             inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -127,9 +143,6 @@ if __name__ == '__main__':
                 input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], max_new_tokens=20, eos_token_id=3
             )
             print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens=True))
-        peft_model_id = f"{model_name_or_path}_{peft_config.peft_type}_{peft_config.task_type}"
-        print(peft_model_id)
-        model.save_pretrained(peft_model_id)
     elif mode == 'eval':
         peft_model_id = sys.argv[2]
         config = PeftConfig.from_pretrained(peft_model_id)
@@ -139,8 +152,10 @@ if __name__ == '__main__':
 
         model.to(device)
         model.eval()
-        i = 8
-        inputs = tokenizer(f'{text_column} : {dataset["test"][i]["question"]} Ans : ', return_tensors="pt")
+        #i = 200
+        prompt = sys.argv[3]
+        #inputs = tokenizer(f'{text_column} : {dataset["test"][i]["best_answer"]} Topic : ', return_tensors="pt")
+        inputs = tokenizer('best_answer: ' + prompt + ' Topic: ', return_tensors="pt")
 
         with torch.no_grad():
             inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -148,3 +163,6 @@ if __name__ == '__main__':
                 input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], max_new_tokens=10, eos_token_id=3
             )
             print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens=True))
+
+    
+    
